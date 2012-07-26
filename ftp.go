@@ -37,6 +37,17 @@ type response struct {
 	c    *ServerConn
 }
 
+type Entries []*Entry
+
+func (s Entries) Len() int      { return len(s) }
+func (s Entries) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+type ByTime struct { Entries }
+func (s ByTime) Less(i, j int) bool { return s.Entries[i].Time.Before(s.Entries[j].Time) }
+
+type ByName struct { Entries }
+func (s ByName) Less(i, j int) bool { return s.Entries[i].Name < s.Entries[j].Name }
+
 // Connect to a ftp server and returns a ServerConn handler.
 func Connect(addr string) (*ServerConn, error) {
 	conn, err := textproto.Dial("tcp", addr)
