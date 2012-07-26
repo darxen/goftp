@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"errors"
 )
 
@@ -28,6 +29,7 @@ type Entry struct {
 	Name string
 	Type EntryType
 	Size uint64
+	Time time.Time
 }
 
 type response struct {
@@ -153,6 +155,13 @@ func parseListLine(line string) (*Entry, error) {
 	default:
 		return nil, errors.New("Unknown entry type")
 	}
+
+	e.Size, _ = strconv.ParseUint(fields[4], 10, 64)
+
+	//fields[5] - month
+	//fields[6] - day
+	//fields[7] - time hh:mm (24 hour clock) OR year
+	e.Time, _ = time.Parse("Jan 2 15:04", strings.Join(fields[5:8], " "))
 
 	e.Name = strings.Join(fields[8:], " ")
 	return e, nil
