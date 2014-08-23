@@ -8,7 +8,7 @@ import (
 
 const (
 	testData = "Just some text"
-	testDir = "mydir"
+	testDir  = "mydir"
 )
 
 func TestConn(t *testing.T) {
@@ -57,6 +57,13 @@ func TestConn(t *testing.T) {
 		r.Close()
 	}
 
+	r, err = c.Retr("tset")
+	if err != nil {
+		t.Error(err)
+	} else {
+		r.Close()
+	}
+
 	err = c.Delete("tset")
 	if err != nil {
 		t.Error(err)
@@ -76,7 +83,7 @@ func TestConn(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	} else {
-		if dir != "/" + testDir {
+		if dir != "/"+testDir {
 			t.Error("Wrong dir: " + dir)
 		}
 	}
@@ -91,10 +98,35 @@ func TestConn(t *testing.T) {
 		t.Error(err)
 	}
 
+	err = c.Logout()
+	if err != nil {
+		t.Error(err)
+	}
+
 	c.Quit()
 
 	err = c.NoOp()
 	if err == nil {
 		t.Error("Expected error")
 	}
+}
+
+// ftp.mozilla.org uses multiline 220 response
+func TestConn2(t *testing.T) {
+	c, err := Connect("ftp.mozilla.org:21")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = c.Login("anonymous", "anonymous")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.List(".")
+	if err != nil {
+		t.Error(err)
+	}
+
+	c.Quit()
 }
