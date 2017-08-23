@@ -1,10 +1,11 @@
 // Package ftp implements a FTP client as described in RFC 959.
+//
+// A textproto.Error is returned for errors at the protocol level.
 package ftp
 
 import (
 	"bufio"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/textproto"
@@ -16,6 +17,7 @@ import (
 // EntryType describes the different types of an Entry.
 type EntryType int
 
+// The differents types of an Entry
 const (
 	EntryTypeFile EntryType = iota
 	EntryTypeFolder
@@ -23,10 +25,16 @@ const (
 )
 
 // ServerConn represents the connection to a remote FTP server.
+// It should be protected from concurrent accesses.
 type ServerConn struct {
-	conn     *textproto.Conn
-	host     string
-	features map[string]string
+	// Do not use EPSV mode
+	DisableEPSV bool
+
+	conn          *textproto.Conn
+	host          string
+	timeout       time.Duration
+	features      map[string]string
+	mlstSupported bool
 }
 
 // Entry describes a file and is returned by List().
@@ -37,10 +45,11 @@ type Entry struct {
 	Time time.Time
 }
 
-// response represent a data-connection
-type response struct {
-	conn net.Conn
-	c    *ServerConn
+// Response represents a data-connection
+type Response struct {
+	conn   net.Conn
+	c      *ServerConn
+	closed bool
 }
 
 type Entries []*Entry
@@ -48,26 +57,48 @@ type Entries []*Entry
 func (s Entries) Len() int      { return len(s) }
 func (s Entries) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
-type ByTime struct { Entries }
+type ByTime struct{ Entries }
+
 func (s ByTime) Less(i, j int) bool { return s.Entries[i].Time.Before(s.Entries[j].Time) }
 
-type ByName struct { Entries }
+type ByName struct{ Entries }
+
 func (s ByName) Less(i, j int) bool { return s.Entries[i].Name < s.Entries[j].Name }
 
-// Connect initializes the connection to the specified ftp server address.
+// Connect is an alias to Dial, for backward compatibility
+func Connect(addr string) (*ServerConn, error) {
+	return Dial(addr)
+}
+
+// Dial is like DialTimeout with no timeout
+func Dial(addr string) (*ServerConn, error) {
+	return DialTimeout(addr, 0)
+}
+
+// DialTimeout initializes the connection to the specified ftp server address.
 //
 // It is generally followed by a call to Login() as most FTP commands require
 // an authenticated user.
-func Connect(addr string) (*ServerConn, error) {
-	conn, err := textproto.Dial("tcp", addr)
+func DialTimeout(addr string, timeout time.Duration) (*ServerConn, error) {
+	tconn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, err
 	}
 
-	a := strings.SplitN(addr, ":", 2)
+	// Use the resolved IP address in case addr contains a domain name
+	// If we use the domain name, we might not resolve to the same IP.
+	remoteAddr := tconn.RemoteAddr().String()
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	conn := textproto.NewConn(tconn)
+
 	c := &ServerConn{
 		conn:     conn,
-		host:     a[0],
+		host:     host,
+		timeout:  timeout,
 		features: make(map[string]string),
 	}
 
@@ -81,6 +112,10 @@ func Connect(addr string) (*ServerConn, error) {
 	if err != nil {
 		c.Quit()
 		return nil, err
+	}
+
+	if _, mlstSupported := c.features["MLST"]; mlstSupported {
+		c.mlstSupported = true
 	}
 
 	return c, nil
@@ -108,8 +143,12 @@ func (c *ServerConn) Login(user, password string) error {
 	}
 
 	// Switch to binary mode
-	_, _, err = c.cmd(StatusCommandOK, "TYPE I")
-	if err != nil {
+	if _, _, err = c.cmd(StatusCommandOK, "TYPE I"); err != nil {
+		return err
+	}
+
+	// Switch to UTF-8
+	if err := c.setUTF8(); err != nil {
 		return err
 	}
 
@@ -153,6 +192,31 @@ func (c *ServerConn) feat() error {
 	return nil
 }
 
+// setUTF8 issues an "OPTS UTF8 ON" command.
+func (c *ServerConn) setUTF8() error {
+	if _, ok := c.features["UTF8"]; !ok {
+		return nil
+	}
+
+	code, message, err := c.cmd(-1, "OPTS UTF8 ON")
+	if err != nil {
+		return err
+	}
+
+	// The ftpd "filezilla-server" has FEAT support for UTF8, but always returns
+	// "202 UTF8 mode is always enabled. No need to send this command." when
+	// trying to use it. That's OK
+	if code == StatusCommandNotImplemented {
+		return nil
+	}
+
+	if code != StatusCommandOK {
+		return errors.New(message)
+	}
+
+	return nil
+}
+
 // epsv issues an "EPSV" command to get a port number for a data connection.
 func (c *ServerConn) epsv() (port int, err error) {
 	_, line, err := c.cmd(StatusExtendedPassiveMode, "EPSV")
@@ -181,12 +245,16 @@ func (c *ServerConn) pasv() (port int, err error) {
 	start := strings.Index(line, "(")
 	end := strings.LastIndex(line, ")")
 	if start == -1 || end == -1 {
-		err = errors.New("Invalid EPSV response format")
-		return
+		return 0, errors.New("Invalid PASV response format")
 	}
 
 	// We have to split the response string
 	pasvData := strings.Split(line[start+1:end], ",")
+
+	if len(pasvData) < 6 {
+		return 0, errors.New("Invalid PASV response format")
+	}
+
 	// Let's compute the port number
 	portPart1, err1 := strconv.Atoi(pasvData[4])
 	if err1 != nil {
@@ -205,36 +273,29 @@ func (c *ServerConn) pasv() (port int, err error) {
 	return
 }
 
-// openDataConn creates a new FTP data connection.
-func (c *ServerConn) openDataConn() (net.Conn, error) {
-	var port int
-	var err error
+// getDataConnPort returns a port for a new data connection
+// it uses the best available method to do so
+func (c *ServerConn) getDataConnPort() (int, error) {
+	if !c.DisableEPSV {
+		if port, err := c.epsv(); err == nil {
+			return port, nil
+		}
 
-	//  If features contains nat6 or EPSV => EPSV
-	//  else -> PASV
-	_, nat6Supported := c.features["nat6"]
-	_, epsvSupported := c.features["EPSV"]
-	if nat6Supported || epsvSupported {
-		port, err = c.epsv()
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		port, err = c.pasv()
-		if err != nil {
-			return nil, err
-		}
+		// if there is an error, disable EPSV for the next attempts
+		c.DisableEPSV = true
 	}
 
-	// Build the new net address string
-	addr := fmt.Sprintf("%s:%d", c.host, port)
+	return c.pasv()
+}
 
-	conn, err := net.Dial("tcp", addr)
+// openDataConn creates a new FTP data connection.
+func (c *ServerConn) openDataConn() (net.Conn, error) {
+	port, err := c.getDataConnPort()
 	if err != nil {
 		return nil, err
 	}
 
-	return conn, nil
+	return net.DialTimeout("tcp", net.JoinHostPort(c.host, strconv.Itoa(port)), c.timeout)
 }
 
 // cmd is a helper function to execute a command and check for the expected FTP
@@ -245,15 +306,23 @@ func (c *ServerConn) cmd(expected int, format string, args ...interface{}) (int,
 		return 0, "", err
 	}
 
-	code, line, err := c.conn.ReadResponse(expected)
-	return code, line, err
+	return c.conn.ReadResponse(expected)
 }
 
-// cmdDataConn executes a command which require a FTP data connection.
-func (c *ServerConn) cmdDataConn(format string, args ...interface{}) (net.Conn, error) {
+// cmdDataConnFrom executes a command which require a FTP data connection.
+// Issues a REST FTP command to specify the number of bytes to skip for the transfer.
+func (c *ServerConn) cmdDataConnFrom(offset uint64, format string, args ...interface{}) (net.Conn, error) {
 	conn, err := c.openDataConn()
 	if err != nil {
 		return nil, err
+	}
+
+	if offset != 0 {
+		_, _, err := c.cmd(StatusRequestFilePending, "REST %d", offset)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
 	}
 
 	_, err = c.conn.Cmd(format, args...)
@@ -262,71 +331,27 @@ func (c *ServerConn) cmdDataConn(format string, args ...interface{}) (net.Conn, 
 		return nil, err
 	}
 
-	code, msg, err := c.conn.ReadCodeLine(-1)
+	code, msg, err := c.conn.ReadResponse(-1)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 	if code != StatusAlreadyOpen && code != StatusAboutToSend {
 		conn.Close()
-		return nil, &textproto.Error{code, msg}
+		return nil, &textproto.Error{Code: code, Msg: msg}
 	}
 
 	return conn, nil
 }
 
-// parseListLine parses the various non-standard format returned by the LIST
-// FTP command.
-func parseListLine(line string) (*Entry, error) {
-	fields := strings.Fields(line)
-	if len(fields) < 9 {
-		return nil, errors.New("Unsupported LIST line")
-	}
-
-	e := &Entry{}
-	switch fields[0][0] {
-	case '-':
-		e.Type = EntryTypeFile
-	case 'd':
-		e.Type = EntryTypeFolder
-	case 'l':
-		e.Type = EntryTypeLink
-	default:
-		return nil, errors.New("Unknown entry type")
-	}
-
-	if e.Type == EntryTypeFile {
-		size, err := strconv.ParseUint(fields[4], 10, 0)
-		if err != nil {
-			return nil, err
-		}
-		e.Size = size
-	}
-	var timeStr string
-	if strings.Contains(fields[7], ":") { // this year
-		thisYear, _, _ := time.Now().Date()
-		timeStr = fields[6] + " " + fields[5] + " " + strconv.Itoa(thisYear)[2:4] + " " + fields[7] + " GMT"
-	} else { // not this year
-		timeStr = fields[6] + " " + fields[5] + " " + fields[7][2:4] + " " + "00:00" + " GMT"
-	}
-	t, err := time.Parse("_2 Jan 06 15:04 MST", timeStr)
-	if err != nil {
-		return nil, err
-	}
-	e.Time = t
-
-	e.Name = strings.Join(fields[8:], " ")
-	return e, nil
-}
-
 // NameList issues an NLST FTP command.
 func (c *ServerConn) NameList(path string) (entries []string, err error) {
-	conn, err := c.cmdDataConn("NLST %s", path)
+	conn, err := c.cmdDataConnFrom(0, "NLST %s", path)
 	if err != nil {
 		return
 	}
 
-	r := &response{conn, c}
+	r := &Response{conn: conn, c: c}
 	defer r.Close()
 
 	scanner := bufio.NewScanner(r)
@@ -341,26 +366,34 @@ func (c *ServerConn) NameList(path string) (entries []string, err error) {
 
 // List issues a LIST FTP command.
 func (c *ServerConn) List(path string) (entries []*Entry, err error) {
-	conn, err := c.cmdDataConn("LIST %s", path)
+	var cmd string
+	var parseFunc func(string) (*Entry, error)
+
+	if c.mlstSupported {
+		cmd = "MLSD"
+		parseFunc = parseRFC3659ListLine
+	} else {
+		cmd = "LIST"
+		parseFunc = parseListLine
+	}
+
+	conn, err := c.cmdDataConnFrom(0, "%s %s", cmd, path)
 	if err != nil {
 		return
 	}
 
-	r := &response{conn, c}
+	r := &Response{conn: conn, c: c}
 	defer r.Close()
 
-	bio := bufio.NewReader(r)
-	for {
-		line, e := bio.ReadString('\n')
-		if e == io.EOF {
-			break
-		} else if e != nil {
-			return nil, e
-		}
-		entry, err := parseListLine(line)
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		entry, err := parseFunc(scanner.Text())
 		if err == nil {
 			entries = append(entries, entry)
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 	return
 }
@@ -398,18 +431,35 @@ func (c *ServerConn) CurrentDir() (string, error) {
 	return msg[start+1 : end], nil
 }
 
+// FileSize issues a SIZE FTP command, which Returns the size of the file
+func (c *ServerConn) FileSize(path string) (int64, error) {
+	_, msg, err := c.cmd(StatusFile, "SIZE %s", path)
+	if err != nil {
+		return 0, err
+	}
+
+	return strconv.ParseInt(msg, 10, 64)
+}
+
 // Retr issues a RETR FTP command to fetch the specified file from the remote
 // FTP server.
 //
 // The returned ReadCloser must be closed to cleanup the FTP data connection.
-func (c *ServerConn) Retr(path string) (io.ReadCloser, error) {
-	conn, err := c.cmdDataConn("RETR %s", path)
+func (c *ServerConn) Retr(path string) (*Response, error) {
+	return c.RetrFrom(path, 0)
+}
+
+// RetrFrom issues a RETR FTP command to fetch the specified file from the remote
+// FTP server, the server will not send the offset first bytes of the file.
+//
+// The returned ReadCloser must be closed to cleanup the FTP data connection.
+func (c *ServerConn) RetrFrom(path string, offset uint64) (*Response, error) {
+	conn, err := c.cmdDataConnFrom(offset, "RETR %s", path)
 	if err != nil {
 		return nil, err
 	}
 
-	r := &response{conn, c}
-	return r, nil
+	return &Response{conn: conn, c: c}, nil
 }
 
 // Stor issues a STOR FTP command to store a file to the remote FTP server.
@@ -417,7 +467,16 @@ func (c *ServerConn) Retr(path string) (io.ReadCloser, error) {
 //
 // Hint: io.Pipe() can be used if an io.Writer is required.
 func (c *ServerConn) Stor(path string, r io.Reader) error {
-	conn, err := c.cmdDataConn("STOR %s", path)
+	return c.StorFrom(path, r, 0)
+}
+
+// StorFrom issues a STOR FTP command to store a file to the remote FTP server.
+// Stor creates the specified file with the content of the io.Reader, writing
+// on the server will start at the given file offset.
+//
+// Hint: io.Pipe() can be used if an io.Writer is required.
+func (c *ServerConn) StorFrom(path string, r io.Reader, offset uint64) error {
+	conn, err := c.cmdDataConnFrom(offset, "STOR %s", path)
 	if err != nil {
 		return err
 	}
@@ -450,6 +509,41 @@ func (c *ServerConn) Delete(path string) error {
 	return err
 }
 
+// RemoveDirRecur deletes a non-empty folder recursively using
+// RemoveDir and Delete
+func (c *ServerConn) RemoveDirRecur(path string) error {
+	err := c.ChangeDir(path)
+	if err != nil {
+		return err
+	}
+	currentDir, err := c.CurrentDir()
+	if err != nil {
+		return err
+	}
+	entries, err := c.List(currentDir)
+	for _, entry := range entries {
+		if entry.Name != ".." && entry.Name != "." {
+			if entry.Type == EntryTypeFolder {
+				err = c.RemoveDirRecur(currentDir + "/" + entry.Name)
+				if err != nil {
+					return err
+				}
+			} else {
+				err = c.Delete(entry.Name)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+	err = c.ChangeDirToParent()
+	if err != nil {
+		return err
+	}
+	err = c.RemoveDir(currentDir)
+	return err
+}
+
 // MakeDir issues a MKD FTP command to create the specified directory on the
 // remote FTP server.
 func (c *ServerConn) MakeDir(path string) error {
@@ -474,7 +568,7 @@ func (c *ServerConn) NoOp() error {
 
 // Logout issues a REIN FTP command to logout the current user.
 func (c *ServerConn) Logout() error {
-	_, _, err := c.cmd(StatusLoggedIn, "REIN")
+	_, _, err := c.cmd(StatusReady, "REIN")
 	return err
 }
 
@@ -486,17 +580,26 @@ func (c *ServerConn) Quit() error {
 }
 
 // Read implements the io.Reader interface on a FTP data connection.
-func (r *response) Read(buf []byte) (int, error) {
-	n, err := r.conn.Read(buf)
-	return n, err
+func (r *Response) Read(buf []byte) (int, error) {
+	return r.conn.Read(buf)
 }
 
 // Close implements the io.Closer interface on a FTP data connection.
-func (r *response) Close() error {
+// After the first call, Close will do nothing and return nil.
+func (r *Response) Close() error {
+	if r.closed {
+		return nil
+	}
 	err := r.conn.Close()
 	_, _, err2 := r.c.conn.ReadResponse(StatusClosingDataConnection)
 	if err2 != nil {
 		err = err2
 	}
+	r.closed = true
 	return err
+}
+
+// SetDeadline sets the deadlines associated with the connection.
+func (r *Response) SetDeadline(t time.Time) error {
+	return r.conn.SetDeadline(t)
 }
